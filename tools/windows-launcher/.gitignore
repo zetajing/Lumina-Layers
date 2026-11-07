@@ -2,3 +2,5 @@
 /obj/
 LuminaLauncher.json
 logs/
+backups/
+launcher-update-*.json

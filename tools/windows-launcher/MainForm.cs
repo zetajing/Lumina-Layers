@@ -5,6 +5,8 @@ using System.Drawing;
 using System.IO;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Collections.Generic;
+using System.Web.Script.Serialization;
 
 namespace LuminaLauncher
 {
@@ -13,7 +15,10 @@ namespace LuminaLauncher
         private readonly string configFile;
         private LauncherSettings settings;
         private LauncherController controller;
+        private UpdateController updater;
+        private UpdateInfo latest;
         private readonly ConcurrentQueue<string> messages = new ConcurrentQueue<string>();
+        private readonly ConcurrentQueue<string> updateStages = new ConcurrentQueue<string>();
         private readonly Label status = new Label();
         private readonly Label backend = new Label();
         private readonly Label frontend = new Label();
@@ -23,6 +28,9 @@ namespace LuminaLauncher
         private readonly Button open = MakeButton("打开 Lumina 网页", Color.White, Color.FromArgb(30, 41, 59));
         private readonly Button configure = MakeButton("设置", Color.White, Color.FromArgb(71, 85, 105));
         private readonly Button toggleLog = MakeButton("查看日志", Color.White, Color.FromArgb(71, 85, 105));
+        private readonly Button checkUpdates = MakeButton("检查更新", Color.FromArgb(239, 246, 255), Color.FromArgb(37, 99, 235));
+        private readonly Button updateNow = MakeButton("一键更新", Color.FromArgb(37, 99, 235), Color.White);
+        private readonly Label version = new Label();
         private readonly TextBox log = new TextBox();
         private readonly TableLayoutPanel layout = new TableLayoutPanel();
         private readonly NotifyIcon tray = new NotifyIcon();
@@ -34,7 +42,7 @@ namespace LuminaLauncher
         private bool logVisible;
         private bool trayHintShown;
 
-        public MainForm(string configFile)
+        public MainForm(string configFile, bool resumeServices)
         {
             this.configFile = configFile;
             Text = "Lumina 启动器";
@@ -43,15 +51,15 @@ namespace LuminaLauncher
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(620, 367);
+            ClientSize = new Size(620, 475);
             BackColor = Color.FromArgb(245, 247, 251);
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
 
             layout.Dock = DockStyle.Fill;
             layout.Padding = new Padding(24, 16, 24, 14);
             layout.ColumnCount = 1;
-            layout.RowCount = 7;
-            foreach (int height in new[] { 72, 96, 66, 42, 29, 0 }) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            layout.RowCount = 8;
+            foreach (int height in new[] { 72, 96, 66, 108, 42, 29, 23 }) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             Controls.Add(layout);
 
@@ -88,13 +96,31 @@ namespace LuminaLauncher
             stop.Click += async (s, e) => await RunOperationAsync(false);
             open.Click += (s, e) => OpenPage();
 
+            var updates = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(12, 6, 12, 6), ColumnCount = 2, RowCount = 3 };
+            updates.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            updates.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            updates.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            updates.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            updates.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            version.Text = "版本更新 · 尚未检查";
+            version.Dock = DockStyle.Fill;
+            version.TextAlign = ContentAlignment.MiddleLeft;
+            version.AutoEllipsis = true;
+            updates.Controls.Add(version, 0, 0); updates.SetColumnSpan(version, 2);
+            updates.Controls.Add(checkUpdates, 0, 1); updates.Controls.Add(updateNow, 1, 1);
+            var updateHint = new Label { Text = "请先保存网页工程；一键更新会自动备份并重启服务。", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true, ForeColor = Color.FromArgb(100, 116, 139) };
+            updates.Controls.Add(updateHint, 0, 2); updates.SetColumnSpan(updateHint, 2);
+            layout.Controls.Add(updates, 0, 3);
+            checkUpdates.Click += async (s, e) => await RunUpdateAsync(false);
+            updateNow.Click += async (s, e) => await RunUpdateAsync(true);
+
             var tools = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
             tools.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
             tools.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             tools.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
             tools.Controls.Add(toggleLog, 0, 0);
             tools.Controls.Add(configure, 2, 0);
-            layout.Controls.Add(tools, 0, 3);
+            layout.Controls.Add(tools, 0, 4);
             configure.Click += (s, e) => ShowSettings();
             toggleLog.Click += (s, e) => {
                 logVisible = !logVisible;
@@ -107,19 +133,18 @@ namespace LuminaLauncher
             detail.AutoEllipsis = true;
             detail.ForeColor = Color.FromArgb(71, 85, 105);
             detail.TextAlign = ContentAlignment.MiddleLeft;
-            layout.Controls.Add(detail, 0, 4);
+            layout.Controls.Add(detail, 0, 5);
             log.Multiline = true;
             log.ReadOnly = true;
-            log.ScrollBars = ScrollBars.Vertical;
+            log.ScrollBars = ScrollBars.Both;
             log.WordWrap = false;
             log.Dock = DockStyle.Fill;
             log.BackColor = Color.FromArgb(15, 23, 42);
             log.ForeColor = Color.FromArgb(226, 232, 240);
             log.Font = new Font("Consolas", 9F);
             log.Visible = false;
-            layout.Controls.Add(log, 0, 6);
-            layout.Controls.Add(new Label { Text = "关闭窗口后留在托盘；托盘菜单可退出并停止服务。", ForeColor = Color.FromArgb(100, 116, 139), Dock = DockStyle.Bottom, AutoSize = true }, 0, 5);
-            layout.RowStyles[5].Height = 23;
+            layout.Controls.Add(log, 0, 7);
+            layout.Controls.Add(new Label { Text = "关闭窗口后留在托盘；托盘菜单可退出并停止服务。", ForeColor = Color.FromArgb(100, 116, 139), Dock = DockStyle.Bottom, AutoSize = true }, 0, 6);
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("显示启动器", null, (s, e) => RestoreWindow());
@@ -147,7 +172,12 @@ namespace LuminaLauncher
             LoadController();
             timer.Interval = 2000;
             timer.Tick += async (s, e) => await RefreshStatusAsync();
-            Shown += async (s, e) => { timer.Start(); await RefreshStatusAsync(); };
+            Shown += async (s, e) => {
+                timer.Start();
+                await RefreshStatusAsync();
+                ShowUpdateReceipt();
+                if (resumeServices) await RunOperationAsync(true);
+            };
         }
 
         private static Button MakeButton(string text, Color background, Color foreground)
@@ -165,6 +195,8 @@ namespace LuminaLauncher
             settings = LauncherSettings.Load(configFile);
             controller = new LauncherController(settings, Path.Combine(Path.GetDirectoryName(configFile), "logs"));
             controller.LogReceived += messages.Enqueue;
+            updater = new UpdateController(settings, controller, configFile);
+            updater.Progress += updateStages.Enqueue;
         }
 
         private async Task RefreshStatusAsync()
@@ -195,7 +227,7 @@ namespace LuminaLauncher
         {
             if (busy) return false;
             busy = true;
-            start.Enabled = stop.Enabled = configure.Enabled = exitMenu.Enabled = false;
+            start.Enabled = stop.Enabled = configure.Enabled = exitMenu.Enabled = checkUpdates.Enabled = updateNow.Enabled = false;
             status.Text = launch ? "● 启动中" : "● 停止中";
             status.ForeColor = Color.FromArgb(37, 99, 235);
             detail.Text = launch ? "正在启动前后端，请稍候…" : "正在停止当前项目的服务…";
@@ -216,6 +248,8 @@ namespace LuminaLauncher
             {
                 busy = false;
                 stop.Enabled = exitMenu.Enabled = true;
+                checkUpdates.Enabled = true;
+                updateNow.Enabled = latest == null || (latest.Available && !latest.HasLocalChanges);
                 FlushLog();
             }
             await RefreshStatusAsync();
@@ -226,6 +260,7 @@ namespace LuminaLauncher
         {
             string line;
             while (messages.TryDequeue(out line)) log.AppendText(line + Environment.NewLine);
+            while (updateStages.TryDequeue(out line)) if (busy) detail.Text = line;
             if (log.TextLength > 100000) log.Text = log.Text.Substring(log.TextLength - 60000);
         }
 
@@ -237,6 +272,98 @@ namespace LuminaLauncher
 
         private void RestoreWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
 
+        private void ShowUpdateReceipt()
+        {
+            string receipt = Path.Combine(Path.GetDirectoryName(configFile), "launcher-update-result.json");
+            if (!File.Exists(receipt)) return;
+            try
+            {
+                var result = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(receipt));
+                if (result != null && result.ContainsKey("success") && !Convert.ToBoolean(result["success"]))
+                    MessageBox.Show(this, Convert.ToString(result["message"]), "启动器替换未完成", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                File.Delete(receipt);
+            }
+            catch (Exception ex) { controller.Log("读取启动器更新结果失败 · " + ex.Message); }
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == Program.ShowMessage) RestoreWindow();
+            base.WndProc(ref message);
+        }
+
+        private void ShowVersion(UpdateInfo info)
+        {
+            latest = info;
+            version.Text = "当前 " + info.CurrentCommit.Substring(0, 7) + " · " +
+                (info.Available ? "可更新 " + info.PendingCommits + " 个提交" : "已是最新版本") +
+                (info.HasLocalChanges ? " · 有本地改动" : "");
+        }
+
+        private async Task RunUpdateAsync(bool apply)
+        {
+            if (busy) return;
+            busy = true;
+            start.Enabled = stop.Enabled = open.Enabled = configure.Enabled = exitMenu.Enabled = checkUpdates.Enabled = updateNow.Enabled = false;
+            status.Text = apply ? "● 更新中" : "● 检查中";
+            status.ForeColor = Color.FromArgb(37, 99, 235);
+            UpdateResult result = null;
+            try
+            {
+                if (!apply)
+                {
+                    var info = await updater.CheckAsync();
+                    FlushLog();
+                    ShowVersion(info);
+                    detail.Text = info.Available ? "点击“一键更新”安装；服务目前保持运行。" : "检查完成，当前没有可用更新。";
+                }
+                else
+                {
+                    result = await updater.UpdateAsync();
+                    FlushLog();
+                    ShowVersion(result.UpdatedCommit == null ? result.Version : new UpdateInfo { CurrentCommit = result.UpdatedCommit });
+                    detail.Text = result.BackupDirectory == null ? "当前已是最新版本，无需更新。" : "更新完成，数据备份已保存。";
+                    if (result.SyncWarning != null) controller.Log(result.SyncWarning);
+                }
+            }
+            catch (Exception ex)
+            {
+                FlushLog();
+                detail.Text = "更新操作未完成，请查看日志。";
+                controller.Log(ex.Message);
+                MessageBox.Show(this, ex.Message, "Lumina 更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                result = null;
+            }
+            finally
+            {
+                busy = false;
+                stop.Enabled = exitMenu.Enabled = checkUpdates.Enabled = true;
+                updateNow.Enabled = latest == null || (latest.Available && !latest.HasLocalChanges);
+            }
+            await RefreshStatusAsync();
+            if (result != null && result.StagedLauncherDirectory != null)
+            {
+                Exception restartFailure = null;
+                try
+                {
+                    string helper = Path.Combine(Path.GetDirectoryName(configFile), "ApplyLauncherUpdate.ps1");
+                    var args = new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper, "-ParentId", Process.GetCurrentProcess().Id.ToString(), "-StagedDirectory", result.StagedLauncherDirectory, "-TargetDirectory", Path.GetDirectoryName(configFile) };
+                    string arguments = string.Join(" ", Array.ConvertAll(args, UpdateController.QuoteArgument));
+                    if (result.ResumeServices) arguments += " -ResumeServices";
+                    Process.Start(new ProcessStartInfo("powershell.exe", arguments) { UseShellExecute = false, CreateNoWindow = true });
+                    exiting = true;
+                    Close();
+                }
+                catch (Exception ex) { restartFailure = ex; }
+                if (restartFailure != null)
+                {
+                    controller.Log("重启启动器失败 · " + restartFailure.Message);
+                    if (result.ResumeServices) await RunOperationAsync(true);
+                    MessageBox.Show(this, "代码已更新，请手动重启启动器。\n" + restartFailure.Message, "Lumina 更新");
+                }
+            }
+        }
+
         private void ShowSettings()
         {
             using (var dialog = new SettingsForm(settings))
@@ -245,6 +372,9 @@ namespace LuminaLauncher
                     dialog.Settings.Save(configFile);
                     controller.Dispose();
                     LoadController();
+                    latest = null;
+                    version.Text = "版本更新 · 尚未检查";
+                    updateNow.Enabled = true;
                     detail.Text = "设置已保存，点击启动服务即可。";
                 }
         }

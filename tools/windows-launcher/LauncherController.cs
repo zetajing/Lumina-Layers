@@ -8,6 +8,7 @@ using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 
@@ -96,7 +97,15 @@ namespace LuminaLauncher
         public bool Any { get { return Backend || Frontend; } }
     }
 
-    public sealed class LauncherController : IDisposable
+    public interface ILauncherServices
+    {
+        Task<ServiceState> ProbeAsync();
+        Task StartAsync();
+        Task StopAsync();
+        void Log(string message);
+    }
+
+    public sealed class LauncherController : ILauncherServices, IDisposable
     {
         private readonly LauncherSettings settings;
         private readonly HttpClient http;
@@ -116,6 +125,7 @@ namespace LuminaLauncher
 
         public void Log(string message)
         {
+            message = Regex.Replace(message, @"\x1B\[[0-?]*[ -/]*[@-~]", "");
             string line = DateTime.Now.ToString("HH:mm:ss") + "  " + message;
             lock (logLock)
             {

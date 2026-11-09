@@ -51,6 +51,9 @@ namespace LuminaLauncher
         private readonly LauncherSettings settings;
         private readonly ILauncherServices services;
         private readonly string configFile;
+        private const string LocalLutPath = "lut-preset/";
+        private static readonly HashSet<string> CustomLutExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { ".npy", ".json", ".npz", ".msgpack" };
         public event Action<string> Progress;
 
         public UpdateController(LauncherSettings settings, ILauncherServices services, string configFile)
@@ -134,10 +137,10 @@ namespace LuminaLauncher
         public async Task<UpdateResult> UpdateAsync()
         {
             UpdateInfo info = await CheckAsync();
-            if (info.HasLocalChanges)
-                throw new InvalidOperationException("检测到未提交的代码或文件。请先提交或处理，本次没有修改代码或停止服务。");
             var result = new UpdateResult { Version = info };
             if (!info.Available) return result;
+            if (info.HasLocalChanges)
+                throw new InvalidOperationException("检测到未提交的代码或文件。请先处理这些改动，再重新检查更新。");
             settings.Validate();
             Stage("预先检查合并冲突…");
             string planned = await PrepareMergeAsync(info);
@@ -168,9 +171,10 @@ namespace LuminaLauncher
                 stopped = true;
                 await Task.Run(() => BackupLocalData(Path.Combine(directory, "local-data.zip")));
                 await EnsureUnchangedAsync(info.CurrentCommit);
+                await RefuseDataOverwriteAsync(info.CurrentCommit, planned);
                 await GitAsync("update-ref", "refs/lumina-backups/" + Path.GetFileName(directory), info.CurrentCommit);
                 Stage("应用已检查的更新…");
-                await GitAsync("merge", "--ff-only", "--no-edit", planned);
+                await GitAsync("merge", "--ff-only", "--no-edit", "--no-overwrite-ignore", planned);
                 applied = true;
                 await InstallDependenciesAsync();
                 string builder = Path.Combine(settings.ProjectDirectory, "tools", "windows-launcher", "build.ps1");
@@ -199,7 +203,7 @@ namespace LuminaLauncher
                         await EnsureUnchangedAsync(planned);
                         string tree = (await GitAsync("rev-parse", info.CurrentCommit + "^{tree}")).Output.Trim();
                         string rollback = (await GitAsync("commit-tree", tree, "-p", planned, "-m", "fix: restore previous Lumina version after failed update")).Output.Trim();
-                        await GitAsync("merge", "--ff-only", "--no-edit", rollback);
+                        await GitAsync("merge", "--ff-only", "--no-edit", "--no-overwrite-ignore", rollback);
                         File.WriteAllText(Path.Combine(Path.GetDirectoryName(configFile), "launcher-update-retry.json"),
                             new JavaScriptSerializer().Serialize(new UpdateRetryState { Head = rollback, Target = planned }), Encoding.UTF8);
                         await RunRequiredAsync(settings.PythonExecutable, 1800, "-m", "pip", "install", "-r", Path.Combine(directory, "python-before.txt"));
@@ -258,20 +262,39 @@ namespace LuminaLauncher
 
         private async Task<bool> HasLocalChangesAsync()
         {
-            // Compare normalized contents, not Windows stat/EOL-only porcelain changes.
-            var tracked = await RunGitAsync("diff", "--quiet", "HEAD", "--");
-            if (tracked.ExitCode > 1) throw new InvalidOperationException("无法检查本地代码改动：" + tracked.Error);
-            return tracked.ExitCode == 1 || (await GitAsync("ls-files", "--others", "--exclude-standard")).Output.Length > 0;
+            // Check the index and work tree separately, including when their changes cancel out.
+            foreach (string[] args in new[] { new[] { "diff", "--quiet", "--cached", "HEAD", "--" }, new[] { "diff", "--quiet", "--" } })
+            {
+                var tracked = await RunGitAsync(args);
+                if (tracked.ExitCode > 1) throw new InvalidOperationException("无法检查本地代码改动：" + tracked.Error);
+                if (tracked.ExitCode == 1) return true;
+            }
+            string untracked = (await GitAsync("ls-files", "-z", "--others", "--exclude-standard")).Output;
+            // Lumina writes imports under Custom in the source checkout. Do not treat them as code.
+            return GitPaths(untracked).Any(path =>
+                !path.StartsWith(LocalLutPath + "Custom/", StringComparison.OrdinalIgnoreCase) ||
+                !CustomLutExtensions.Contains(Path.GetExtension(path)));
         }
 
         private async Task RefuseDataOverwriteAsync(string previous, string next)
         {
-            string changes = (await GitAsync("diff", "--name-only", previous, next)).Output;
-            if (changes.Split('\n').Any(path => path.StartsWith("materials/", StringComparison.OrdinalIgnoreCase) || path.Trim() == ".env.local" || path.Trim() == "user_settings.json"))
+            var changes = GitPaths((await GitAsync("diff", "--name-only", "--no-renames", "-z", previous, next)).Output).ToArray();
+            if (changes.Any(path => IsSameOrBelow(path, "materials") || path.Equals(".env.local", StringComparison.OrdinalIgnoreCase) || path.Equals("user_settings.json", StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException("更新试图更改本机数据目录或配置，请改为手动处理；本次未修改代码。");
-            var ignoredLuts = new HashSet<string>((await GitAsync("ls-files", "--others", "--ignored", "--exclude-standard", "--", "lut-preset/")).Output.Split('\n').Select(p => p.TrimEnd('\r')).Where(p => p.Length > 0), StringComparer.OrdinalIgnoreCase);
-            if (changes.Split('\n').Any(path => ignoredLuts.Contains(path.TrimEnd('\r'))))
-                throw new InvalidOperationException("更新中的 LUT 文件与本机导入文件重名，请先人工处理，本次未修改代码。");
+            var localLuts = GitPaths((await GitAsync("ls-files", "-z", "--others", "--", LocalLutPath)).Output);
+            string collision = localLuts.FirstOrDefault(local => changes.Any(path => IsSameOrBelow(local, path) || IsSameOrBelow(path, local)));
+            if (collision != null)
+                throw new InvalidOperationException("更新会覆盖本机 LUT：" + collision + "。请先备份并重命名该 LUT，再重试更新。");
+        }
+
+        private static IEnumerable<string> GitPaths(string output)
+        {
+            return output.Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        private static bool IsSameOrBelow(string path, string parent)
+        {
+            return path.Equals(parent, StringComparison.OrdinalIgnoreCase) || path.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase);
         }
 
         private string MaterialsDirectory()

@@ -315,7 +315,8 @@ namespace LuminaLauncher
                     var info = await updater.CheckAsync();
                     FlushLog();
                     ShowVersion(info);
-                    detail.Text = info.Available ? "点击“一键更新”安装；服务目前保持运行。" : "检查完成，当前没有可用更新。";
+                    detail.Text = !info.Available ? "检查完成，当前没有可用更新。" : info.HasLocalChanges ?
+                        "请先处理未提交的代码或文件，再重新检查更新。" : "点击“一键更新”安装；服务状态不变。";
                 }
                 else
                 {
@@ -329,8 +330,8 @@ namespace LuminaLauncher
             catch (Exception ex)
             {
                 FlushLog();
-                detail.Text = "更新操作未完成，请查看日志。";
-                controller.Log(ex.Message);
+                detail.Text = ex.Message.Split('\n')[0];
+                controller.Log("更新未完成 · " + ex.Message);
                 MessageBox.Show(this, ex.Message, "Lumina 更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 result = null;
             }

@@ -132,10 +132,14 @@ namespace LuminaLauncher
 
         private static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
 
-        private static async Task<bool> FailsAsync(UpdateFixture fixture)
+        private static async Task<bool> FailsAsync(UpdateFixture fixture, string expected = null)
         {
             try { await fixture.Updater.UpdateAsync(); return false; }
-            catch (InvalidOperationException ex) { Console.WriteLine("Expected failure: " + ex.Message); return true; }
+            catch (InvalidOperationException ex)
+            {
+                Console.WriteLine("Update failure: " + ex.Message);
+                return expected == null || ex.Message.Contains(expected);
+            }
         }
 
         private static async Task RunAsync(LauncherSettings executables, string root)
@@ -155,12 +159,18 @@ namespace LuminaLauncher
             checks.Add("Latest-version check and no-op update preserve running services.");
 
             success.Publish("shared.txt", "official version 2\n");
+            const string localLut = "lut-preset/Custom/色卡 (1)_2.json";
+            const string lutContent = "{\"sentinel\":\"本机 LUT\"}";
+            UpdateFixture.Write(success.App, localLut, lutContent);
             var available = await success.Updater.CheckAsync();
             Require(available.Available && available.PendingCommits == 1, "An upstream update was not found.");
+            Require(!available.HasLocalChanges, "A custom LUT was treated as uncommitted code.");
             Require(UpdateFixture.Git(success.App, "rev-parse", "HEAD") == original && success.Services.Stops == 0, "Checking modified the checkout or services.");
             var applied = await success.Updater.UpdateAsync();
             Require(File.ReadAllText(Path.Combine(success.App, "shared.txt")).Trim() == "official version 2", "Upstream code was not installed.");
             Require(File.Exists(Path.Combine(success.App, "launcher-local.txt")), "The custom launcher was lost.");
+            Require(File.ReadAllText(Path.Combine(success.App, localLut)) == lutContent, "The custom LUT was changed.");
+            Require(UpdateFixture.Git(success.App, "ls-files", "--", localLut) == "", "The local LUT was committed.");
             Require(success.Services.Running && success.Services.Starts == 1 && success.Services.Stops == 1, "Running service state was not restored.");
             Require(UpdateFixture.Git(success.App, "rev-parse", "HEAD") == UpdateFixture.Git(success.Root, "--git-dir=" + success.Fork, "rev-parse", "refs/heads/test/launcher"), "The validated update was not pushed to the personal branch.");
             using (var archive = ZipFile.OpenRead(Path.Combine(applied.BackupDirectory, "local-data.zip")))
@@ -169,8 +179,11 @@ namespace LuminaLauncher
                 using (var reader = new StreamReader(archive.GetEntry("materials/品牌/红色/material.json").Open()))
                     Require(reader.ReadToEnd().Contains("自定义耗材目录"), "The configured external materials directory was not backed up.");
                 Require(archive.GetEntry("user_settings.json") != null, "Local settings were not backed up.");
+                using (var reader = new StreamReader(archive.GetEntry(localLut).Open()))
+                    Require(reader.ReadToEnd() == lutContent, "The imported LUT was not backed up byte-for-byte.");
             }
             checks.Add("A real Git merge, pip install, pnpm install/build, backup, restart and personal-branch push succeeded.");
+            checks.Add("An untracked custom LUT with a non-ASCII name is backed up and preserved without committing it.");
 
             string contributor = Path.Combine(success.Root, "fork-author");
             UpdateFixture.Git(success.Root, "clone", "--branch", "test/launcher", success.Fork, contributor);
@@ -193,7 +206,18 @@ namespace LuminaLauncher
             Require((await dirty.Updater.CheckAsync()).HasLocalChanges, "Untracked work was not detected.");
             Require(await FailsAsync(dirty), "An update with untracked work was allowed.");
             Require(dirty.Services.Stops == 0 && UpdateFixture.Git(dirty.App, "rev-parse", "HEAD") == dirtyHead, "Dirty-work protection changed the installation.");
+            File.Move(Path.Combine(dirty.App, "personal-change.txt"), Path.Combine(dirty.Root, "personal-change.txt"));
+            UpdateFixture.Write(dirty.App, localLut, lutContent);
+            UpdateFixture.Git(dirty.App, "add", "--", localLut);
+            Require((await dirty.Updater.CheckAsync()).HasLocalChanges && await FailsAsync(dirty, "未提交"), "A staged LUT edit was allowed.");
             checks.Add("Uncommitted and untracked work blocks the update before stopping services.");
+
+            var lutCollision = new UpdateFixture(Path.Combine(root, "lut-collision"), executables);
+            UpdateFixture.Write(lutCollision.App, localLut, lutContent);
+            lutCollision.Publish("lut-preset/Custom/色卡 (1)_2.JSON", "upstream LUT\n");
+            Require(await FailsAsync(lutCollision, "更新会覆盖本机 LUT：" + localLut), "A case-insensitive collision with an imported LUT was missed.");
+            Require(lutCollision.Services.Stops == 0 && File.ReadAllText(Path.Combine(lutCollision.App, localLut)) == lutContent, "A colliding update stopped services or changed the LUT.");
+            checks.Add("A case-insensitive collision with a custom LUT is blocked before stopping services.");
 
             var conflict = new UpdateFixture(Path.Combine(root, "conflict"), executables);
             UpdateFixture.Write(conflict.App, "shared.txt", "local version\n");

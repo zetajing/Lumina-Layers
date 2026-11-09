@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows-launcher/build
 
 有更新时按以下顺序执行：
 
-1. 检查未提交/未跟踪文件，在 Git 对象中预检合并。发现冲突时停止，不改工作区、不停止服务。
+1. 检查未提交/未跟踪文件，在 Git 对象中预检合并。网页导入到 `lut-preset/Custom/` 的未跟踪 LUT 会保留并备份；其他未提交改动或合并冲突会拦截更新。
 2. 在 EXE 旁 `backups/update-时间-编号/` 保存当前代码 ZIP、Python 依赖清单、旧启动器与配置。
 3. 停止服务，备份实际使用的耗材目录（支持 `.env.local` 和环境变量覆盖）、本机设置、环境配置和 LUT。
 4. 应用预检通过的合并，安装 Python 依赖，按锁文件安装并构建前端，编译新启动器，检查前后端健康。

@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -250,6 +252,35 @@ namespace LuminaLauncher
             var retried = await failure.Updater.UpdateAsync();
             Require(retried.UpdatedCommit != null && File.ReadAllText(Path.Combine(failure.App, "requirements.txt")).Contains("corrected") && failure.Services.Running, "A corrected update could not be applied after rollback.");
             checks.Add("Retry successfully combines the restored update with a later upstream fix.");
+
+            var server = new TcpListener(IPAddress.Loopback, 0);
+            server.Start();
+            try
+            {
+                UpdateFixture.Git(success.App, "config", "http.proxy", "");
+                UpdateFixture.Git(success.App, "remote", "set-url", "origin", "http://127.0.0.1:" + ((IPEndPoint)server.LocalEndpoint).Port + "/git");
+                var responses = Task.Run(() => {
+                    foreach (string status in new[] { "503 Service Unavailable", "404 Not Found" })
+                    {
+                        using (var client = server.AcceptTcpClient())
+                        using (var stream = client.GetStream())
+                        using (var request = new StreamReader(stream, Encoding.ASCII))
+                        {
+                            stream.ReadTimeout = 5000;
+                            string header;
+                            while (!string.IsNullOrEmpty(header = request.ReadLine())) { }
+                            byte[] response = Encoding.ASCII.GetBytes("HTTP/1.1 " + status + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            stream.Write(response, 0, response.Length);
+                        }
+                    }
+                });
+                Require(await FailsAsync(success, "repository") && await Task.WhenAny(responses, Task.Delay(2000)) == responses,
+                    "Fetch did not retry a 503 or did not stop at a permanent error.");
+                await responses;
+                Require(!server.Pending(), "Fetch retried after a permanent 404 error.");
+            }
+            finally { server.Stop(); }
+            checks.Add("A real Git fetch retries a transient HTTP 503 and reports a permanent HTTP 404.");
 
             File.WriteAllText(Path.Combine(root, "report.json"), new JavaScriptSerializer().Serialize(new { passed = true, checks = checks }), Encoding.UTF8);
             Console.WriteLine("PASS: " + checks.Count + " updater integration checks.");

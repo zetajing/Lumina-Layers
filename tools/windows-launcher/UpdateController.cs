@@ -85,7 +85,7 @@ namespace LuminaLauncher
             if (File.Exists(Path.Combine(root, ".git", "MERGE_HEAD")))
                 throw new InvalidOperationException("仓库有尚未完成的合并，请先处理后再更新。");
             Stage("检查官方 Lumina 更新…");
-            await GitAsync("fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main");
+            await FetchAsync("origin", "+refs/heads/main:refs/remotes/origin/main");
             await AddTargetAsync(info, "refs/remotes/origin/main");
             var tracking = await RunGitAsync("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}");
             if (tracking.ExitCode == 0)
@@ -99,7 +99,7 @@ namespace LuminaLauncher
                     if (info.TrackingRemote != "origin" || info.TrackingBranch != "main")
                     {
                         Stage("检查启动器分支更新…");
-                        await GitAsync("fetch", "--no-tags", info.TrackingRemote,
+                        await FetchAsync(info.TrackingRemote,
                             "+refs/heads/" + info.TrackingBranch + ":refs/remotes/" + reference);
                         await AddTargetAsync(info, "refs/remotes/" + reference);
                     }
@@ -378,6 +378,23 @@ namespace LuminaLauncher
         private Task<CommandResult> RunGitAsync(params string[] arguments)
         {
             return RunAsync("git.exe", 120, new[] { "-c", "core.quotepath=false" }.Concat(arguments).ToArray());
+        }
+
+        private async Task FetchAsync(string remote, string refspec)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                var result = await RunGitAsync("fetch", "--no-tags", remote, refspec);
+                if (result.ExitCode == 0) return;
+                string error = (result.Error + result.Output).Trim();
+                if (attempt >= 3 || !new[] { "failed to receive handshake", "connection was reset", "connection reset",
+                        "failed to connect", "connection timed out", "could not resolve host",
+                        "returned error: 502", "returned error: 503", "returned error: 504" }
+                    .Any(message => error.IndexOf(message, StringComparison.OrdinalIgnoreCase) >= 0))
+                    throw new InvalidOperationException("无法检查远端 " + remote + " 的更新：" + error);
+                Stage("远端 " + remote + " 连接暂时失败，正在重试（" + attempt + "/2）…");
+                await Task.Delay(TimeSpan.FromSeconds(attempt));
+            }
         }
 
         private async Task<CommandResult> GitAsync(params string[] arguments)

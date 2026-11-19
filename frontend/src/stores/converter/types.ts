@@ -186,6 +186,8 @@ export interface ConverterDocumentState {
   materialMaxLayerCount: number;
   quantize_colors: number;
   quantize_colors_unlocked: boolean;
+  /** Advanced switch: allow fixed material layer counts above 10 (up to 30). */
+  materialLayersUnlocked: boolean;
   high_precision_3d_preview: boolean;
   enable_cleanup: boolean;
   svg_hole_compensation_enabled: boolean;
@@ -395,9 +397,11 @@ export interface ConverterRuntimeState {
   // LUT 列表
   lutList: string[];
   lutListLoading: boolean;
+  lutListError: string | null;
   lutListFull: LutInfo[];
   legacyCatalogGroups: LutDetailsCatalogGroup[];
   legacyCatalogLoading: boolean;
+  legacyCatalogError: string | null;
   selectedLegacyManufacturer: string;
 
   // LUT 全部颜色
@@ -515,6 +519,7 @@ export interface ConverterState extends ConverterDocumentState, ConverterSourceR
 // ========== Actions Interface ==========
 
 export interface ConverterActions {
+  expireSession: (sessionId: string) => void;
   setProjectSettings: (changes: Partial<import("./project").ProjectConverterSettings>) => void;
   /** Publish a fully prepared project without resetting/re-importing its source. */
   commitProjectRestore: (state: ConverterState) => void;
@@ -557,6 +562,7 @@ export interface ConverterActions {
   setModelMargin: (value: number | null) => void;
   setQuantizeColors: (colors: number) => void;
   setQuantizeColorsUnlocked: (unlocked: boolean) => void;
+  setMaterialLayersUnlocked: (unlocked: boolean) => void;
   setHighPrecision3dPreview: (enabled: boolean) => void;
   setEnableCleanup: (enabled: boolean) => void;
   setSvgHoleCompensationEnabled: (enabled: boolean) => void;
@@ -727,6 +733,7 @@ export interface ConverterActions {
 
   // API 操作
   uploadLut: (file: File) => Promise<void>;
+  refreshResourceCatalog: () => Promise<void>;
   fetchLutList: (options?: ApiRequestOptions) => Promise<void>;
   fetchLutCatalog: (signal?: AbortSignal) => Promise<void>;
   fetchLegacyCatalog: (options?: ApiRequestOptions) => Promise<void>;

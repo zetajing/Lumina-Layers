@@ -53,6 +53,58 @@ describe("conversion preferences", () => {
     } finally { stopAgain(); }
   });
 
+  it("remembers 30-layer settings and the unlock switch", async () => {
+    const stop = bindConversionPreferences();
+    const store = useConverterStore.getState();
+    store.setSourceVersion("material");
+    store.setMaterialLayersUnlocked(true);
+    store.setMaterialLayerCount(30);
+    store.setMaterialLayerHeightMm(0.04);
+    store.setTargetWidthMm(180);
+    stop();
+    const stored = localStorage.getItem("lumina-settings")!;
+    expect(JSON.parse(stored).state.conversionPreferences.last).toMatchObject({
+      materialLayersUnlocked: true, materialLayerCount: 30, materialLayerHeightMm: 0.04, size_mm: 180,
+    });
+
+    // Reload: a fresh store starts locked at 10 layers, then restores everything.
+    useSettingsStore.setState({ ...DEFAULT_SETTINGS });
+    localStorage.setItem("lumina-settings", stored);
+    await useSettingsStore.persist.rehydrate();
+    useConverterStore.setState({ ...DEFAULT_STATE });
+    const stopAgain = bindConversionPreferences();
+    try {
+      expect(useConverterStore.getState()).toMatchObject({
+        materialLayersUnlocked: true, materialLayerCount: 30, materialLayerHeightMm: 0.04, target_width_mm: 180,
+      });
+    } finally { stopAgain(); }
+  });
+
+  it("unlocks deep layer counts from records saved before the switch existed", () => {
+    const prefs = normalizeConversionPreferences({ last: {
+      ...captureConversionParameters({ ...DEFAULT_STATE, source_version: "material" } as never),
+      materialLayerCount: 24, materialLayersUnlocked: undefined,
+    } });
+    expect(prefs.last?.materialLayerCount).toBe(24);
+    applyConversionParameters(useConverterStore.getState, prefs.last!);
+    expect(useConverterStore.getState()).toMatchObject({ materialLayersUnlocked: true, materialLayerCount: 24 });
+  });
+
+  it.each([false, undefined])("restores a 30-layer dynamic range without enabling the fixed unlock (%s)", (unlock) => {
+    useConverterStore.getState().setMaterialDynamicLayerCountEnabled(true);
+    useConverterStore.getState().setMaterialMinLayerCount(12);
+    useConverterStore.getState().setMaterialMaxLayerCount(30);
+    const saved = captureConversionParameters(useConverterStore.getState());
+    expect(saved).toMatchObject({ materialMinLayerCount: 12, materialMaxLayerCount: 30 });
+    const prefs = normalizeConversionPreferences({ last: { ...saved, materialLayersUnlocked: unlock } });
+    useConverterStore.setState({ ...DEFAULT_STATE });
+    applyConversionParameters(useConverterStore.getState, prefs.last!);
+    expect(useConverterStore.getState()).toMatchObject({
+      materialDynamicLayerCountEnabled: true, materialMinLayerCount: 12,
+      materialMaxLayerCount: 30, materialLayersUnlocked: false,
+    });
+  });
+
   it("restores saved inputs after reconnecting without persisting session data", async () => {
     const stop = bindConversionPreferences();
     useConverterStore.getState().setStructureMode(StructureMode.SINGLE_SIDED);

@@ -22,7 +22,7 @@ Windows ARM、32 位或 free-threaded Python 尚无完整应用所需的 wheel �
 
 3MF 导出链路使用两个独立依赖：
 
-- 元数据 SDK：`fatcat-metadata==0.1.5`，Python 导入名为 `fatcat_metadata`。
+- 元数据 SDK：`fatcat-metadata==0.1.6`，Python 导入名为 `fatcat_metadata`。
   包含 11 月原生切片配置、Bambu H3C 和不同长度的耗材参数组支持，
   并保留 Windows 长路径和精确机型查询修复。Prusa 使用 3.0.0-alpha13 预览版。
 - 写包库：`neroued-3mf==0.4.2`，使用原作者正式发布的 PyPI wheel。
@@ -32,6 +32,10 @@ Windows ARM、32 位或 free-threaded Python 尚无完整应用所需的 wheel �
   无需安装 fork 版本或应用补丁；写包库与 FatCat SDK 的版本独立。
 
 ### 使用预编译包
+
+源码启动前会检查依赖版本、原生模块、FatCat 适配器和随包数据。`python api_server.py --check-dependencies` 只检查后端；`python start_all.py --check-dependencies` 还会检查 Node.js 和已安装的 Vite。统一启动器使用它实际选中的 Python 做检查，失败时在清理端口和启动服务前退出。已有 Vite 可直接运行时，不要求 pnpm 留在 PATH 中。
+
+公开 CI 使用正式 PyPI wheel，并在 Windows、Linux、Apple Silicon Mac 的干净 Python 3.12 环境中按 README 安装、启动后端、生成 3MF，关闭源会话后再次下载并检查几何和原生配置。此检查属于源码 Nightly 必经的 Layered Mesh Geometry 工作流；维护者自行编译 SDK 的结果不代替源码安装验证。
 
 在下一节创建并激活干净的虚拟环境后，从 Lumina 仓库根目录执行：
 
@@ -51,8 +55,8 @@ python -m pip install -r requirements.txt
 来源提交、仓库和版本由 `scripts/fatcat_packaging_contract.py`
 统一维护。FatCat 来自公开仓库
 [`MOVIBALE/fatcat-metadata`](https://github.com/MOVIBALE/fatcat-metadata)，固定
-完整提交 `c94c6344c2964c3d47229d8708e6c8f5a3b49961`。构建脚本从其根目录
-的 `pyproject.toml` 构建 `0.1.5` wheel，无需进入 `cpp/`，不会修改 SDK 源码。
+完整提交 `8ab3ab05a8850738de7533de3eda5e05edd77afd`。构建脚本从其根目录
+的 `pyproject.toml` 构建 `0.1.6` wheel，无需进入 `cpp/`，不会修改 SDK 源码。
 以下供维护者复现源码构建；普通用户使用上方 PyPI 安装即可。
 它需要 Git、CMake 和 C++20 编译器（FatCat 本身使用 C++17）。
 源码提交和版本必须与下方固定值一致。
@@ -64,7 +68,7 @@ writer 固定在上游 v0.4.2 提交 `656f87c55caf742cef2e958a7fc5199cdba2c6f0`�
 
 ```powershell
 git clone https://github.com/MOVIBALE/fatcat-metadata.git ..\fatcat-metadata
-git -C ..\fatcat-metadata checkout c94c6344c2964c3d47229d8708e6c8f5a3b49961
+git -C ..\fatcat-metadata checkout 8ab3ab05a8850738de7533de3eda5e05edd77afd
 git clone https://github.com/Neroued/neroued_3mf.git ..\neroued-3mf
 git -C ..\neroued-3mf checkout 656f87c55caf742cef2e958a7fc5199cdba2c6f0
 
@@ -143,7 +147,7 @@ pnpm --dir electron start
 这是有意的设计：软件不跟随系统的显示器分辨率或系统缩放，换屏幕、改系统缩放都不会改变界面的排版比例，只有用户自己选档才会变。代价是文字的实际物理大小随屏幕而变（高分屏上偏大），观感与其他跟随系统设置的应用不同；如果改成直接使用系统缩放，排版就会重新由系统决定，这正是当前实现要避免的。
 
 - **100%（默认）**：上述统一尺寸。缩放倍数按窗口所在显示器的逻辑尺寸计算（`min(宽 / 1536, 高 / 864)`），把分辨率和系统缩放一并抵消掉。
-- **80%–175%**：在统一尺寸的基础上再放大或缩小，档位为 80、90、100、110、125、150、175。
+- **30%–180%**：在统一尺寸的基础上再放大或缩小，每 10 个百分点一档。旧版保存的 125% 和 175% 分别按 130% 和 180% 读取。
 - **快捷键**：Ctrl 加号、Ctrl 减号逐档调整，Ctrl 0 回到 100%；macOS 用 Command。键盘由 `before-input-event` 接管；macOS 原生「显示」菜单使用同一套持久化缩放逻辑。
 - **最小窗口**：页面至少保留 960×620 CSS 像素，窗口最小尺寸等于它乘以当前页面倍数，切换档位或换屏时更新，避免面板挤压后遮住 3D 工具栏。已打开的普通窗口小于新的最小尺寸时会主动放大，并保持在工作区内；最大化、最小化和全屏窗口不调整。所选档位按这个最小尺寸放不进屏幕工作区时，页面倍数会降到刚好放得下。
 

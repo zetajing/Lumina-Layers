@@ -87,6 +87,7 @@ import {
   type SvgHoleCompensationOptions,
 } from "../../constants/svgHoleCompensation";
 import { tRuntime } from "../../i18n/runtime";
+import { useResourceStore } from "../resourceStore";
 import {
   postClientLog,
   summarizeErrorForLog,
@@ -146,7 +147,7 @@ import {
 } from "./previewCommitGuard";
 import { buildMissingAutoReliefHeightMap,buildPreviewParams } from "./requests";
 import {
-  buildConversionSourceParams,buildNativeModelDefaults,buildNativeModelState,clampValue,filterNativeBrandGroups,getMaterialArchiveReliefMinimumExtraHeight,getNativeBrandGroupByKey,getNativeDbNamesForGroup,getNativeDbOptionNames,getSelectedNativeBrandGroup,getSupportedModeByPair,inferDefaultMaterialBackingDirName,isDynamicMaterialActive,MATERIAL_DYNAMIC_LAYER_COUNT_MAX,MATERIAL_DYNAMIC_LAYER_COUNT_MIN,normalizeDynamicMaterialLayerCount,normalizeLegacyLutNames,normalizeLutColorMode,normalizeLutDrivenReliefState,normalizeLutGroups,normalizeNativeBrandGroups,normalizePublicColorMode,normalizeStringArray,RELIEF_MAX_EXTRA_HEIGHT_MM,resolveConverterSourceSelection,resolveMaterialPrintLayerCount,resolveNativeBrandSelection,resolveNativeSupportedModeForBrand,resolvePreferredSupportedMode,
+  buildConversionSourceParams,buildNativeModelDefaults,buildNativeModelState,clampValue,filterNativeBrandGroups,getMaterialArchiveReliefMinimumExtraHeight,getNativeBrandGroupByKey,getNativeDbNamesForGroup,getNativeDbOptionNames,getSelectedNativeBrandGroup,getSupportedModeByPair,inferDefaultMaterialBackingDirName,isDynamicMaterialActive,MATERIAL_DYNAMIC_LAYER_COUNT_DEFAULT_MAX,MATERIAL_DYNAMIC_LAYER_COUNT_MIN,materialLayerCountLimit,MATERIAL_LAYER_COUNT_LOCKED_MAX,normalizeDynamicMaterialLayerCount,normalizeLegacyLutNames,normalizeLutColorMode,normalizeLutDrivenReliefState,normalizeLutGroups,normalizeNativeBrandGroups,normalizePublicColorMode,normalizeStringArray,RELIEF_MAX_EXTRA_HEIGHT_MM,resolveConverterSourceSelection,resolveMaterialPrintLayerCount,resolveNativeBrandSelection,resolveNativeSupportedModeForBrand,resolvePreferredSupportedMode,
 } from "./sources";
 import type {
   ConverterActions,ConverterState,ModelSurfaceModelRotation,ModelSurfacePlacement,PendingReplacement,RegionData,SelectionMode,SelectionTool,SourceVersion,
@@ -154,7 +155,7 @@ import type {
 export { CONVERTER_ERROR_KEYS } from "./generationActions";
 export { buildLayerImagesSourceKey } from "./previewArtifacts";
 export {
-  clampValue,getMaterialArchiveReliefMinimumExtraHeight,getMaterialArchiveReliefMinimumTotalHeight,inferDefaultMaterialBackingDirName,isDynamicMaterialActive,MATERIAL_DYNAMIC_LAYER_COUNT_MAX,MATERIAL_DYNAMIC_LAYER_COUNT_MIN,resolveConverterSourceSelection,
+  clampValue,getMaterialArchiveReliefMinimumExtraHeight,getMaterialArchiveReliefMinimumTotalHeight,inferDefaultMaterialBackingDirName,isDynamicMaterialActive,MATERIAL_DYNAMIC_LAYER_COUNT_DEFAULT_MAX,MATERIAL_DYNAMIC_LAYER_COUNT_MAX,MATERIAL_DYNAMIC_LAYER_COUNT_MIN,MATERIAL_LAYER_COUNT_MAX,MATERIAL_LAYER_COUNT_LOCKED_MAX,materialLayerCountLimit,resolveConverterSourceSelection,
 } from "./sources";
 export type {
   ContentCommitStatus,ConverterActions,ConverterState,ModelSurfaceModelRotation,ModelSurfacePlacement,ModelSurfacePlacementMode,PendingReplacement,RegionData,SelectionDocument,SelectionMode,SelectionTool,SourceVersion,WorkshopConverterImageInput,
@@ -317,6 +318,33 @@ function clearedHeightmapUploadState() {
 function rawPreviewFailureMessage(error: unknown): string {
   const detail = visibleConverterError(error, tRuntime("api_error_http_default"));
   return tRuntime("converter_raw_preview_failed", { error: detail });
+}
+
+async function recoverBrowserImagePreview(file: File, failedUrl: string): Promise<void> {
+  const isCurrent = (url: string | null) => {
+    const state = useConverterStore.getState();
+    return state.imageFile === file && state.imagePreviewUrl === url;
+  };
+  if (!isCurrent(failedUrl)) return;
+  try {
+    const { preview_url, width, height } = await uploadImagePreview(file);
+    if (!isCurrent(failedUrl)) return;
+    useConverterStore.setState({
+      imagePreviewUrl: preview_url,
+      ...buildImageAspectRatioState(useConverterStore.getState(), width / height),
+      error: null,
+    });
+  } catch (error) {
+    if (!isCurrent(failedUrl)) return;
+    useConverterStore.setState({
+      imagePreviewUrl: null,
+      cropModalOpen: false,
+      error: tRuntime("converter_image_preview_failed", {
+        error: visibleConverterError(error, tRuntime("api_error_http_default")),
+      }),
+    });
+  }
+  if (failedUrl.startsWith("blob:")) URL.revokeObjectURL(failedUrl);
 }
 
 function isSvgFile(file: File): boolean {
@@ -1776,9 +1804,11 @@ function buildLegacySelectionAvailabilityUpdates(
     | "legacyCatalogGroups"
   >,
   availableNames: Iterable<string>,
+  aliases: Record<string, string> = {},
 ): Partial<ConverterState> {
   const available = new Set(availableNames);
-  const normalized = normalizeLegacyLutNames(state.lut_names, state.lut_name);
+  const normalized = [...new Set(normalizeLegacyLutNames(state.lut_names, state.lut_name)
+    .map((name) => available.has(name) ? name : aliases[name] ?? name))];
   if (normalized.length === 0) {
     return {};
   }
@@ -1952,13 +1982,14 @@ export const DEFAULT_STATE: ConverterState = {
   materialBackingMaterialDirName: loadMaterialBackingMaterialDirName(),
   materialDynamicLayerCountEnabled: false,
   materialMinLayerCount: MATERIAL_DYNAMIC_LAYER_COUNT_MIN,
-  materialMaxLayerCount: MATERIAL_DYNAMIC_LAYER_COUNT_MAX,
+  materialMaxLayerCount: MATERIAL_DYNAMIC_LAYER_COUNT_DEFAULT_MAX,
   materialDynamicRecipes: [],
   materialLayerBenefitCurve: [],
   materialLayerBenefitScope: "all_printable_pixels",
   materialLayerBenefitPixelCount: 0,
   quantize_colors: 48,
   quantize_colors_unlocked: false,
+  materialLayersUnlocked: false,
   high_precision_3d_preview: false,
   enable_cleanup: true,
   ...loadSvgHoleCompensationSettings(),
@@ -2062,9 +2093,11 @@ export const DEFAULT_STATE: ConverterState = {
   modelUrl: null,
   lutList: [],
   lutListLoading: false,
+  lutListError: null,
   lutListFull: [],
   legacyCatalogGroups: [],
   legacyCatalogLoading: false,
+  legacyCatalogError: null,
   selectedLegacyManufacturer: "",
   lutColors: [],
   lutColorCards: [],
@@ -2266,6 +2299,9 @@ async function commitColorRemap(
     const response = await apiReplaceColorsBatch(sid, pairs, previewCommit.operationId);
     if (!isCurrentReplacementPreviewCommit(getState(), previewCommit)) return;
     setState({
+      ...(response.replacement_regions ? {
+        replacement_regions: normalizeReplacementRegionsFromHistory(response.replacement_regions),
+      } : {}),
       replacePreviewLoading: false,
       previewImageUrl: normalizeResourceUrl(response.preview_url),
       previewBaseImageUrl: normalizeResourceUrl(response.preview_url),
@@ -2394,6 +2430,30 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
       if (previewChanged && (current.sessionId || current.isLoading || current.hasManualPreview)) _get().invalidatePreviewForAutoRefresh();
     }),
 
+    expireSession: (sessionId) => {
+      const current = _get();
+      if (current.sessionId !== sessionId) return;
+      _cancelPreviewWork();
+      set({
+        ...buildPreviewSessionResetState(current, true),
+        // Downloads have their own lifetime; keep them when the preview expires.
+        downloadUrl: current.downloadUrl,
+        threemfDiskPath: current.threemfDiskPath,
+        generateWarnings: current.generateWarnings,
+        largeFormatWarnings: current.largeFormatWarnings,
+        largeFormatFailedTiles: current.largeFormatFailedTiles,
+        previewAutoRefreshPending: false,
+        isGenerating: false,
+        gradientGroups: null,
+        gradientGroupsLoading: false,
+        gradientGroupsError: null,
+        gradientGroupsSessionId: null,
+        gradientSelection: null,
+        selectedGradientRegions: [],
+        error: tRuntime("converter_session_expired"),
+      });
+    },
+
     // --- 图片 ---
     commitProjectRestore: (state) => {
       _cancelPreviewWork();
@@ -2487,6 +2547,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
         const ratio = img.naturalWidth / img.naturalHeight;
         set(buildImageAspectRatioState(_get(), ratio));
       };
+      img.onerror = () => { void recoverBrowserImagePreview(file, previewUrl); };
       img.src = previewUrl;
 
       const isSvg = isSvgImageFile(file);
@@ -3152,7 +3213,11 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
     setMaterialLayerCount: documentCommand((count: number) => {
       const materialSuggestionReset = _cancelMaterialSuggestionWork();
       set((state) => {
-        const materialLayerCount = clampValue(Math.round(count), 1, 20);
+        const materialLayerCount = clampValue(
+          Math.round(count),
+          1,
+          materialLayerCountLimit(state.materialLayersUnlocked),
+        );
         return {
           materialLayerCount,
           ...materialSuggestionReset,
@@ -3196,13 +3261,12 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
       const materialSuggestionReset = _cancelMaterialSuggestionWork();
       set((state) => {
         const materialMinLayerCount = normalizeDynamicMaterialLayerCount(
-          count,
-          state.materialMinLayerCount,
+          count, state.materialMinLayerCount,
         );
         const materialMaxLayerCount = Math.max(
           normalizeDynamicMaterialLayerCount(
             state.materialMaxLayerCount,
-            MATERIAL_DYNAMIC_LAYER_COUNT_MAX,
+            MATERIAL_DYNAMIC_LAYER_COUNT_DEFAULT_MAX,
           ),
           materialMinLayerCount,
         );
@@ -3229,8 +3293,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
       const materialSuggestionReset = _cancelMaterialSuggestionWork();
       set((state) => {
         const materialMaxLayerCount = normalizeDynamicMaterialLayerCount(
-          count,
-          state.materialMaxLayerCount,
+          count, state.materialMaxLayerCount,
         );
         const materialMinLayerCount = Math.min(
           normalizeDynamicMaterialLayerCount(
@@ -3585,6 +3648,28 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
         quantize_colors: clampValue(state.quantize_colors, 8, upperBound),
         threemfDiskPath: null,
         downloadUrl: null,
+      });
+    }),
+    setMaterialLayersUnlocked: documentCommand((unlocked: boolean) => {
+      const state = _get();
+      if (state.materialLayersUnlocked === unlocked) return;
+      if (unlocked) {
+        set({ materialLayersUnlocked: true });
+        return;
+      }
+      // This switch only limits fixed layers; dynamic ranges always allow 30.
+      // 此开关只限制固定层数，动态范围始终允许最高 30 层。
+      const cap = MATERIAL_LAYER_COUNT_LOCKED_MAX;
+      if (state.materialLayerCount <= cap) {
+        set({ materialLayersUnlocked: false });
+        return;
+      }
+      _cancelPreviewWork();
+      set({
+        materialLayersUnlocked: false,
+        materialLayerCount: Math.min(state.materialLayerCount, cap),
+        ..._cancelMaterialSuggestionWork(),
+        ...buildPreviewSessionResetState(state, true),
       });
     }),
     setHighPrecision3dPreview: documentCommand((enabled: boolean) =>
@@ -6147,26 +6232,39 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
 
     // --- API 操作 ---
     uploadLut: async (file: File) => {
-      set({ lutListLoading: true, error: null });
+      set({ error: null });
       try {
-        const res = await apiUploadLut(file);
-        // 上传成功后通过 catalog 刷新 legacy/native 共享状态，再选中新 LUT
-        await Promise.all([
-          _get().fetchLutCatalog(),
-          _get().fetchLegacyCatalog(),
-        ]);
-        _get().setLutName(res.name);
+        await apiUploadLut(file);
+        // Import only updates inventory. The open picker owns staged choices
+        // and validates task context and compatibility before applying them.
+        await _get().refreshResourceCatalog();
       } catch (err) {
         set({
           error: visibleConverterError(err, "LUT 上传失败"),
         });
-      } finally {
-        set({ lutListLoading: false });
+        throw err;
+      }
+    },
+
+    refreshResourceCatalog: async () => {
+      set({ legacyCatalogLoading: true, lutListLoading: true, legacyCatalogError: null, lutListError: null });
+      const [catalog, details] = await Promise.allSettled([apiFetchLutCatalog(), apiFetchLutDetailsCatalog()]);
+      if (catalog.status === "fulfilled") {
+        const luts = catalog.value.legacy_groups.flatMap((group) => group.items);
+        useResourceStore.getState().observeLibrary("luts", luts.length);
+        set({ lutListFull: luts, lutList: luts.map((item) => item.name), lutListLoading: false });
+      } else {
+        set({ lutListLoading: false, lutListError: visibleConverterError(catalog.reason, tRuntime("lut_library_load_failed")) });
+      }
+      if (details.status === "fulfilled") {
+        set({ legacyCatalogGroups: details.value.groups, legacyCatalogLoading: false });
+      } else {
+        set({ legacyCatalogLoading: false, legacyCatalogError: visibleConverterError(details.reason, tRuntime("lut_library_load_failed")) });
       }
     },
 
     fetchLutList: async (options = {}) => {
-      set({ lutListLoading: true });
+      set({ lutListLoading: true, lutListError: null });
       try {
         const response = await apiFetchLutList(options);
         let luts = response.luts.map(normalizeLutColorMode);
@@ -6194,6 +6292,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
           buildLegacySelectionAvailabilityUpdates(
             selectionState,
             luts.map((lut) => lut.name),
+            response.legacy_aliases,
           ),
         );
         const remembered = updates.lut_name ?? currentState.lut_name;
@@ -6216,6 +6315,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
         set({
           lutListLoading: false,
           error: visibleConverterError(err, "LUT 列表加载失败"),
+          lutListError: visibleConverterError(err, "LUT 列表加载失败"),
         });
       }
     },
@@ -6268,6 +6368,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
           buildLegacySelectionAvailabilityUpdates(
             selectionState,
             legacyLuts.map((lut) => lut.name),
+            response.legacy_aliases,
           ),
         );
         if (remembered) {
@@ -6330,7 +6431,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
     },
 
     fetchLegacyCatalog: async (options = {}) => {
-      set({ legacyCatalogLoading: true, error: null });
+      set({ legacyCatalogLoading: true, legacyCatalogError: null, error: null });
       try {
         const response = await apiFetchLutDetailsCatalog(options);
         const groups = normalizeLutGroups(response.groups ?? []);
@@ -6356,7 +6457,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
           selectedLegacyManufacturer: selectedManufacturer,
         });
       } catch (err) {
-        set({ legacyCatalogLoading: false });
+        set({ legacyCatalogLoading: false, legacyCatalogError: visibleConverterError(err, "LUT 详情目录加载失败") });
         _get().setError(visibleConverterError(err, "LUT 详情目录加载失败"));
       }
     },
@@ -6925,7 +7026,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
         const portableProjectColors = clonePortableProjectColorState(state);
         const remapReplacementRegions = colorRemapToReplacementRegions(
           state.colorRemapMap,
-          state.palette,
+          state.palette, state.replacement_regions,
         );
         const previewReplacementRegions = [
           ...portableProjectColors.replacement_regions,
@@ -7418,6 +7519,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
             }
             set(buildImageAspectRatioState(_get(), img.naturalWidth / img.naturalHeight));
           };
+          img.onerror = () => { void recoverBrowserImagePreview(lastFile, previewUrl); };
           img.src = previewUrl;
 
           set({
@@ -7652,6 +7754,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
           }
           set(buildImageAspectRatioState(_get(), img.naturalWidth / img.naturalHeight));
         };
+        img.onerror = () => { void recoverBrowserImagePreview(singleFile, previewUrl); };
         img.src = previewUrl;
 
         set({
@@ -7832,6 +7935,7 @@ export const useConverterStore = create<ConverterState & ConverterActions>()(
     // --- 完整流水线（preview → generate）---
     submitFullPipeline: async () => {
       const state = _get();
+      if (state.isLoading || state.isGenerating) return null;
 
       // Refuse the unsupported pair before starting a preview that generation
       // would reject anyway.
@@ -8120,7 +8224,7 @@ export const converterDocumentHistory = installConverterDocumentHistory(useConve
   const restored = useConverterStore.getState();
   const file = restored.imageFile;
   const previewUrl = restored.imagePreviewUrl;
-  if (file && sources.aspectRatio === null) {
+  if (file && (sources.aspectRatio === null || previewUrl?.startsWith("blob:"))) {
     const publishDimensions = (width: number, height: number, url?: string) => {
       const latest = useConverterStore.getState();
       if (latest.imageFile === file && latest.imagePreviewUrl === previewUrl) useConverterStore.setState({ ...buildImageAspectRatioState(latest, width / height), ...(url ? { imagePreviewUrl: url } : {}) });
@@ -8131,7 +8235,10 @@ export const converterDocumentHistory = installConverterDocumentHistory(useConve
       });
     } else if (previewUrl) {
       const image = new Image();
-      image.onload = () => publishDimensions(image.naturalWidth, image.naturalHeight);
+      image.onload = () => {
+        if (sources.aspectRatio === null) publishDimensions(image.naturalWidth, image.naturalHeight);
+      };
+      image.onerror = () => { void recoverBrowserImagePreview(file, previewUrl); };
       image.src = previewUrl;
     }
   }

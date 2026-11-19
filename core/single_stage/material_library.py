@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from core.filament_display import filament_display
 from . import (
     material_files,
     material_package,
@@ -215,6 +216,11 @@ def _saved_material_library_item_from_archive(
     )
     usage_payload = material_files._load_usage_payload(material_dir)
     return {
+        "display": {
+            **filament_display(archive_payload),
+            **filament_display(archive_payload.get("display")),
+            **material_runs.measured_gradient_preview(archive_payload),
+        } or None,
         "material_name": material_name,
         "directory_name": relative_directory_name,
         "brand": brand_value,
@@ -646,6 +652,7 @@ def export_saved_stage_a_material_archives(
     """
     normalized_names = material_files._normalize_material_directory_names(directory_names)
     target_root = Path(materials_dir or material_files.MATERIALS_DIR)
+    installed_identities = material_sync._installed_package_identities(target_root)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     download_filename = f"lumina_materials_{len(normalized_names)}_{timestamp}.zip"
     zip_output_path = (
@@ -695,6 +702,10 @@ def export_saved_stage_a_material_archives(
                         material_dir=material_dir,
                     )
                 )
+                signature = material_sync._material_sync_signature(package_manifest)
+                installed_identity = installed_identities.get(signature) if signature else None
+                if installed_identity is not None:
+                    package_manifest["material_id"], package_manifest["revision_id"] = installed_identity
                 bundle_manifest["packages"].append(package_manifest)
                 for file_path, zip_path in files_to_write:
                     archive.write(file_path, zip_path)
@@ -722,6 +733,8 @@ def import_saved_stage_a_material_archives(
     materials_dir: str | None = None,
     selected_material_id: str | None = None,
     selected_revision_id: str | None = None,
+    selected_display: dict[str, Any] | None = None,
+    preserve_internal_paths: bool = False,
 ) -> MaterialArchiveImportResult:
     """Import one ZIP file containing one or more saved Stage A material archives.
     导入一个包含一个或多个已保存 Stage A 耗材档案的 ZIP 文件。
@@ -733,11 +746,13 @@ def import_saved_stage_a_material_archives(
             bundle. (可选：从 bundle 中只导入指定 material_id)
         selected_revision_id: Optional package revision_id to import from a
             bundle. (可选：从 bundle 中只导入指定 revision_id)
+        preserve_internal_paths: Keep old directory IDs when staging private
+            project resources. (项目私有资源暂存时保留旧目录 ID)
 
     Returns:
         MaterialArchiveImportResult: Imported material summaries. (导入后的耗材摘要)
     """
-    from core.material_lut_synthesis import validate_stage_a_solver_parameters
+    from core.material_lut_synthesis import load_material_params, validate_stage_a_solver_parameters
 
     selected_material_id = str(selected_material_id or "").strip()
     selected_revision_id = str(selected_revision_id or "").strip()
@@ -763,6 +778,8 @@ def import_saved_stage_a_material_archives(
             ):
                 manifest_root = extract_root
         bundle_manifest = material_package._load_material_bundle_manifest(manifest_root)
+        if selected_material_id and bundle_manifest is None:
+            raise ValueError("A selected material revision requires a versioned material bundle manifest")
         manifest = material_package._load_material_export_manifest(manifest_root)
         material_root = (
             extracted_root / "materials"
@@ -785,6 +802,8 @@ def import_saved_stage_a_material_archives(
                         or raw_revision_id != selected_revision_id
                     ):
                         continue
+                    if selected_package_found:
+                        raise ValueError("Selected material revision is duplicated in the bundle")
                     selected_package_found = True
                 material_package._verify_material_bundle_package(
                     extracted_root=manifest_root,
@@ -822,7 +841,7 @@ def import_saved_stage_a_material_archives(
             ]
         else:
             staged_material_dirs = sorted(
-                material_files._discover_saved_material_dirs(material_root),
+                material_files._discover_saved_material_dirs(material_root, include_internal=True),
                 key=lambda path: path.as_posix(),
             )
 
@@ -840,12 +859,23 @@ def import_saved_stage_a_material_archives(
                     material_root,
                     staged_material_dir,
                 )
+                restore_to_library = (
+                    not preserve_internal_paths
+                    and material_files._is_internal_material_directory(relative_directory_name)
+                )
                 package = package_by_directory.get(relative_directory_name)
-                if package is not None and material_sync._installed_material_bundle_revision_path(
-                    target_root=target_root,
-                    package=package,
-                ) is not None:
-                    continue
+                if package is not None:
+                    installed_dir = material_sync._installed_material_bundle_revision_path(
+                        target_root=target_root,
+                        package=package,
+                        include_revision_history=bool(selected_material_id),
+                    )
+                    if installed_dir is not None and (
+                        not restore_to_library or not material_files._is_internal_material_directory(
+                            material_files._relative_directory_name(target_root, installed_dir),
+                        )
+                    ):
+                        continue
                 material_archive_path = staged_material_dir / "material.json"
                 if not material_archive_path.is_file():
                     raise FileNotFoundError(
@@ -863,17 +893,26 @@ def import_saved_stage_a_material_archives(
                     raise FileNotFoundError(
                         f"Saved Stage A parameters not found in ZIP: {relative_directory_name}"
                     )
-                stage_a_payload = material_files._load_json_object(
-                    stage_a_params_path,
-                    "Saved Stage A parameters are not valid UTF-8 JSON",
-                )
-                validate_stage_a_solver_parameters(
-                    stage_a_payload,
-                    material_label=relative_directory_name,
-                )
+                destination_name = relative_directory_name
+                if restore_to_library:
+                    # Validate with the conversion loader before publishing a restored entry.
+                    load_material_params(relative_directory_name, materials_dir=str(material_root))
+                    name = material_files._clean_optional_archive_text(archive_payload.get("material_name"))
+                    destination_name = material_files._sanitize_material_dirname(name or staged_material_dir.name)
+                    if material_files._is_internal_material_directory(destination_name):
+                        destination_name = "material"
+                else:
+                    stage_a_payload = material_files._load_json_object(
+                        stage_a_params_path,
+                        "Saved Stage A parameters are not valid UTF-8 JSON",
+                    )
+                    validate_stage_a_solver_parameters(
+                        stage_a_payload,
+                        material_label=relative_directory_name,
+                    )
                 destination_dir = material_files._import_target_material_dir(
                     target_root,
-                    relative_directory_name,
+                    destination_name,
                 )
                 try:
                     if package is not None:
@@ -891,6 +930,8 @@ def import_saved_stage_a_material_archives(
                     raise
                 created_material_dirs.append(destination_dir)
                 if package is not None:
+                    if selected_material_id and selected_display:
+                        package = {**package, "display": {**filament_display(package.get("display")), **filament_display(selected_display)}}
                     installed_packages.append((package, destination_dir))
                 imported_materials.append(
                     _material_summary_from_saved_archive(
@@ -937,21 +978,18 @@ def list_saved_stage_a_material_archives(
         return material_registry_client._apply_official_registry_metadata(cached_items)
 
     items: list[dict[str, Any]] = []
-    archive_paths = [
-        path for path in target_root.rglob("material.json") if path.is_file()
-    ]
-    filtered_archive_paths = material_files._filter_nested_material_archive_paths(archive_paths)
     sync_metadata_by_directory = material_sync._material_sync_metadata_by_directory(target_root)
 
-    for archive_path in sorted(
-        filtered_archive_paths,
-        key=lambda path: path.parent.stat().st_mtime,
+    for material_dir in sorted(
+        material_files._discover_saved_material_dirs(target_root),
+        key=lambda path: path.stat().st_mtime,
         reverse=True,
     ):
-        material_dir = archive_path.parent
         try:
-            archive_payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            archive_payload = json.loads((material_dir / "material.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(archive_payload, dict):
             continue
         item = _saved_material_library_item_from_archive(
             target_root,
@@ -961,7 +999,19 @@ def list_saved_stage_a_material_archives(
         content_hash = material_package._local_material_content_hash(material_dir, archive_payload)
         if content_hash:
             item["content_hash"] = content_hash
-        item.update(sync_metadata_by_directory.get(item["directory_name"], {}))
+        metadata = sync_metadata_by_directory.get(item["directory_name"])
+        if metadata:
+            indexed = dict(metadata)
+            display = indexed.pop("display", None)
+            display_hash = indexed.pop("display_hash", None)
+            item.update(indexed)
+            # A locally renamed or recalibrated archive keeps its own display information.
+            if display and content_hash and display_hash == content_hash:
+                local_display = item.get("display") or {}
+                item["display"] = {**local_display, **display}
+                local_swatches = local_display.get("preview_swatches")
+                if isinstance(local_swatches, dict) and local_swatches.get("source") == "measured":
+                    item["display"]["preview_swatches"] = local_swatches
         items.append(item)
     material_registry_client._apply_official_registry_metadata(items)
     material_files._store_material_library_cache(target_root, items)

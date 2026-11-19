@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from core.filament_display import filament_display
 from . import material_files, material_package
 
 _MATERIAL_REGISTRY_AMBIGUOUS_LOCAL_MATCH_FAILURE_DETAIL = (
@@ -80,6 +81,27 @@ def _material_sync_signature(entry: dict[str, Any]) -> tuple[str, str] | None:
     except ValueError:
         return None
     return local_directory, content_hash
+
+
+def _installed_package_identities(target_root: Path) -> dict[tuple[str, str], tuple[str, str]]:
+    """Return installed IDs and revisions keyed by their directory and content."""
+    installed = _load_material_sync_index(target_root).get("installed")
+    if not isinstance(installed, dict):
+        return {}
+
+    identities: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for material_id, entry in installed.items():
+        if not isinstance(entry, dict):
+            continue
+        signature = _material_sync_signature(entry)
+        revision_id = entry.get("revision_id")
+        if signature and material_id.strip() and isinstance(revision_id, str) and revision_id.strip():
+            identities.setdefault(signature, set()).add((material_id, revision_id))
+    return {
+        signature: next(iter(matches))
+        for signature, matches in identities.items()
+        if len(matches) == 1
+    }
 
 
 def _local_material_sync_entries(target_root: Path) -> list[dict[str, Any]]:
@@ -482,6 +504,8 @@ def _material_sync_metadata_by_directory(target_root: Path) -> dict[str, dict[st
             "sync_channel": channel,
             "sync_official": channel == "official",
         }
+        if display := filament_display(raw_entry.get("display")):
+            metadata[local_directory].update(display=display, display_hash=raw_entry.get("content_hash"))
     return metadata
 
 
@@ -537,6 +561,7 @@ def _record_material_sync_entries(
             "local_directory": material_files._relative_directory_name(target_root, destination_dir),
             "display_brand": str(display.get("brand") or ""),
             "display_name": str(display.get("material_name") or destination_dir.name),
+            "display": filament_display(display),
             "installed_at": now,
             "updated_at": now,
         }
@@ -729,11 +754,13 @@ def _installed_material_bundle_revision_path(
     target_root: Path,
     package: dict[str, Any],
     include_revision_history: bool = False,
+    index: dict[str, Any] | None = None,
 ) -> Path | None:
     material_id = str(package.get("material_id") or "")
     if not material_id:
         return None
-    index = _load_material_sync_index(target_root)
+    if index is None:
+        index = _load_material_sync_index(target_root)
     installed = index.get("installed")
     if not isinstance(installed, dict):
         return None
@@ -782,9 +809,9 @@ def _material_sync_revision_entry_path(
     local_directory = entry.get("local_directory")
     if not isinstance(local_directory, str) or not local_directory.strip():
         return None
-    material_dir = target_root / material_files._normalize_relative_directory_name(local_directory)
-    archive_path = material_dir / "material.json"
     try:
+        material_dir = material_files.resolve_saved_material_dir(target_root, local_directory)
+        archive_path = material_dir / "material.json"
         archive_payload = json.loads(archive_path.read_text(encoding="utf-8"))
         if not isinstance(archive_payload, dict):
             return None

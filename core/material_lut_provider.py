@@ -20,9 +20,11 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from api.structured_logging import get_logger
 from config import MATERIALS_DIR
 from core import material_cache as _material_cache
 from core import material_lut_synthesis as _material_lut_synthesis
+from core.errors import MaterialArchiveUnavailableError
 from core.material_cache import DEFAULT_GRID_RESOLUTION
 from core.material_candidate_cache import (
     MaterialCandidateCacheConfig,
@@ -33,8 +35,28 @@ from core.material_candidate_cache import (
     QUALITY_8M_CANDIDATE_BUDGET,
     build_material_candidate_runtime,
     load_material_candidate_runtime,
+    save_material_candidate_runtime,
 )
 from core.material_color_solver import MaterialParams
+
+_log = get_logger(__name__)
+
+# Per-layer runtimes saved by dynamic Prepare live in this subfolder of the
+# solver cache. Fixed-layer lookups only scan the top-level folder, so saving
+# them here can never change fixed-layer color matching.
+# 动态预构建保存的逐层运行时放在求解缓存的该子目录中；固定层数查找只扫描顶层目录，
+# 因此保存它们绝不会改变固定层数的颜色匹配。
+DYNAMIC_LAYER_RUNTIME_SUBDIRECTORY = "dynamic-layer-runtimes"
+
+# Saved smart-cache budgets probed by fixed-layer lookups, largest first.
+# 固定层数查找时探测的已保存智能缓存预算，按从大到小顺序。
+PERSISTED_RUNTIME_PROBE_BUDGETS: tuple[int, ...] = (
+    MAX_PERSISTED_CANDIDATE_BUDGET,
+    DEFAULT_PERSISTED_CANDIDATE_BUDGET,
+    QUALITY_8M_CANDIDATE_BUDGET,
+    LEGACY_PERSISTED_CANDIDATE_BUDGET,
+    PREVIEW_SAFE_CANDIDATE_BUDGET,
+)
 
 if TYPE_CHECKING:
     from core.material_cache import MaterialSolverCache
@@ -92,13 +114,12 @@ def load_materials(
     """Load material archives for the hot path (memoized).
     为热路径加载耗材档案（带 memo 缓存）。
 
-    Mirrors :func:`core.material_lut_synthesis.load_multiple_materials` exactly,
-    adding a process-local memo so repeated loads of the same palette within a
-    request hit memory. The returned list and its :class:`MaterialParams` are
-    treated as immutable by the pipeline; callers must not mutate them.
+    Memoizes successful loads of the same palette and reports unavailable archives
+    as conversion input errors. The pipeline treats the returned list and its
+    :class:`MaterialParams` as immutable.
 
-    精确镜像 ``load_multiple_materials``，叠加进程内 memo；返回的列表与
-    ``MaterialParams`` 在管线中按不可变对待，调用方不得修改。
+    复用进程内加载结果；不可用的耗材档案按转换输入错误处理。管线将返回的
+    列表与 ``MaterialParams`` 视为不可变。
 
     Args:
         directory_names: Material directory names in user-selected order.
@@ -116,9 +137,16 @@ def load_materials(
         if cached is not None:
             return cached
 
-    loaded = _material_lut_synthesis.load_multiple_materials(
-        directory_names, materials_dir=materials_dir
-    )
+    try:
+        loaded = _material_lut_synthesis.load_multiple_materials(
+            directory_names, materials_dir=materials_dir
+        )
+    except FileNotFoundError as exc:
+        raise MaterialArchiveUnavailableError(
+            f"{exc} Select an available material or import a complete material archive."
+        ) from exc
+    except ValueError as exc:
+        raise MaterialArchiveUnavailableError(str(exc)) from exc
 
     with _materials_lock:
         _materials_memo[key] = loaded
@@ -216,13 +244,7 @@ def load_solver_runtime(
         return cache, actual_grid
 
     if candidate_budget is None:
-        for budget in (
-            MAX_PERSISTED_CANDIDATE_BUDGET,
-            DEFAULT_PERSISTED_CANDIDATE_BUDGET,
-            QUALITY_8M_CANDIDATE_BUDGET,
-            LEGACY_PERSISTED_CANDIDATE_BUDGET,
-            PREVIEW_SAFE_CANDIDATE_BUDGET,
-        ):
+        for budget in PERSISTED_RUNTIME_PROBE_BUDGETS:
             persisted_runtime = load_material_candidate_runtime(
                 materials,
                 layer_count,
@@ -259,6 +281,26 @@ def load_solver_runtime(
     return runtime, runtime.grid_resolution
 
 
+def dynamic_layer_runtime_root(cache_root: str | Path | None = None) -> Path:
+    """Cache root holding per-layer runtimes saved by dynamic Prepare.
+    动态预构建所保存逐层运行时的缓存根目录。
+
+    Pass the result as ``cache_root`` to the candidate-runtime load/save/delete
+    helpers. It sits inside the solver cache folder but is never scanned by
+    fixed-layer lookups, smart-cache listings, or status checks.
+
+    将返回值作为 ``cache_root`` 传给候选运行时的加载/保存/删除函数。该目录位于
+    求解缓存目录内，但固定层数查找、智能缓存列表与状态查询都不会扫描它。
+
+    Args:
+        cache_root: Optional solver cache root override. 可选求解缓存根目录。
+
+    Returns:
+        Path: Isolated root for prepared dynamic runtimes. 动态预构建运行时的独立根目录。
+    """
+    return _material_cache.default_cache_directory(cache_root) / DYNAMIC_LAYER_RUNTIME_SUBDIRECTORY
+
+
 def load_dynamic_candidate_runtime(
     materials: list[MaterialParams],
     layer_count: int,
@@ -267,6 +309,7 @@ def load_dynamic_candidate_runtime(
     *,
     candidate_budget: int = PREVIEW_SAFE_CANDIDATE_BUDGET,
     cache_root: str | Path | None = None,
+    persist: bool = False,
 ) -> tuple["MaterialCandidateRuntime", int | None]:
     """Load/build one pinned-budget candidate runtime for dynamic solving.
 
@@ -292,6 +335,13 @@ def load_dynamic_candidate_runtime(
         candidate_budget: Explicit candidate budget used for this layer.
             本层使用的显式候选预算。
         cache_root: Optional candidate-runtime cache root. 可选候选缓存根目录。
+        persist: Save a freshly built runtime under
+            :func:`dynamic_layer_runtime_root` so later catalog rebuilds (a new
+            layer range or backing material) reuse it without fixed-layer
+            lookups ever seeing it. Save failures are logged and never fail
+            the build. 将新构建的运行时保存到 :func:`dynamic_layer_runtime_root`，
+            使之后的目录重建可直接复用，且固定层数查找永远看不到它；保存失败仅记录
+            日志，不影响构建。
 
     Returns:
         tuple[MaterialCandidateRuntime, int | None]: Candidate runtime and its
@@ -312,6 +362,18 @@ def load_dynamic_candidate_runtime(
     if persisted_runtime is not None:
         return persisted_runtime, persisted_runtime.grid_resolution
 
+    prepared_root = dynamic_layer_runtime_root(cache_root)
+    prepared_runtime = load_material_candidate_runtime(
+        materials,
+        int(layer_count),
+        float(layer_height_mm),
+        str(substrate),
+        candidate_budget=int(config.candidate_budget),
+        cache_root=prepared_root,
+    )
+    if prepared_runtime is not None:
+        return prepared_runtime, prepared_runtime.grid_resolution
+
     runtime = build_material_candidate_runtime(
         materials=materials,
         layer_count=int(layer_count),
@@ -319,7 +381,30 @@ def load_dynamic_candidate_runtime(
         substrate=str(substrate),
         config=config,
     )
+    if persist:
+        _persist_runtime_best_effort(runtime, cache_root=prepared_root)
     return runtime, runtime.grid_resolution
+
+
+def _persist_runtime_best_effort(
+    runtime: "MaterialCandidateRuntime",
+    *,
+    cache_root: str | Path | None,
+) -> None:
+    """Save a runtime, logging instead of raising when the disk write fails."""
+    try:
+        save_material_candidate_runtime(runtime, cache_root=cache_root)
+    except OSError as exc:
+        _log.warning(
+            "Dynamic layer runtime could not be saved",
+            extra={
+                "event": "dynamic_layer_runtime_save_failed",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "layer_count": int(runtime.metadata.get("layer_count", 0)),
+                "candidate_budget": int(runtime.metadata.get("candidate_budget", 0)),
+            },
+        )
 
 
 def clear_memo_caches() -> None:

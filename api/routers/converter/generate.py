@@ -76,7 +76,8 @@ from api.workers.converter_workers import (
 )
 from core.batch_layout import LayoutResult, XYBBox, layout_shelf_by_row
 from core.errors import (
-    CachedPreviewAnalysisError, ExternalSpoolSelectionError, NativeMaterialSelectionError, TemplateSlotCapacityError, WipeTowerLayoutError,
+    CachedPreviewAnalysisError, ExternalSpoolSelectionError, MaterialArchiveUnavailableError,
+    NativeMaterialSelectionError, TemplateSlotCapacityError, WipeTowerLayoutError,
 )
 from .export_materials import require_material_selection
 from core.model_surface.types import ModelSurfaceError
@@ -270,6 +271,14 @@ from .common import (
 
 router = APIRouter()
 log = get_logger(__name__)
+
+_EXPORT_INPUT_ERRORS = (
+    ExternalSpoolSelectionError,
+    MaterialArchiveUnavailableError,
+    NativeMaterialSelectionError,
+    TemplateSlotCapacityError,
+    WipeTowerLayoutError,
+)
 
 # ---------------------------------------------------------------------------
 # Batch merge constants (not exposed via API / UI / settings)
@@ -2520,19 +2529,38 @@ async def convert_generate(
     if override_material_matrix_path is not None:
         material_matrix_path = override_material_matrix_path
 
+    cached_replacements_are_final = False
+    if (
+        session_material_source == "material_archive"
+        and core_modeling_mode in {CoreModelingMode.HIGH_FIDELITY, CoreModelingMode.PIXEL}
+        and matched_rgb_path
+        and mask_solid_path
+        and material_matrix_path
+        and preview_edit_state_matches
+        and not edit_projection_required
+    ):
+        cached_replacements_are_final, _ = _preview_analysis_params_match(
+            cache=cache,
+            request=request,
+            core_modeling_mode=core_modeling_mode,
+            session_material_source=session_material_source,
+            target_width_mm=generation_analysis_target_width_mm,
+            preview_color_layers=session_data.get("color_layers", _MISSING),
+            preview_layer_height_mm=session_data.get("layer_height_mm", _MISSING),
+        )
+
     # 2b. Collect scalar parameters into a dict for the worker
     params: dict = {
         **build_generation_worker_params(request),
         "target_width_mm": request.target_width_mm,
         "modeling_mode": core_modeling_mode,
-        # Dynamic cache reuse already contains every confirmed RGB, recipe,
-        # and solver-metadata edit. Replaying its mappings in S03 would solve
-        # the same edits twice and require a target map outside S02's final-
-        # generation cache contract. Keep legacy fixed-layer replay unchanged.
-        # 动态缓存已包含确认后的最终编辑，不再重放全局替色；固定层路径保持原语义。
+        # Confirmed preview RGB and recipes already contain these edits.
+        # Replaying a portable source-color record against the edited image
+        # can select new pixels and overwrite the recipe the user approved.
         "replacement_regions": (
             None
-            if request.use_cached_matched_rgb and dynamic_material_settings[0]
+            if cached_replacements_are_final
+            or (request.use_cached_matched_rgb and dynamic_material_settings[0])
             else replacement_regions
         ),
         "recipe_overrides": (
@@ -2631,8 +2659,8 @@ async def convert_generate(
             lut_path,
             worker_params,
         )
-    except (WipeTowerLayoutError, NativeMaterialSelectionError, ExternalSpoolSelectionError, TemplateSlotCapacityError) as exc:
-        raise to_http_exception(exc, "3MF layout") from exc
+    except _EXPORT_INPUT_ERRORS as exc:
+        raise to_http_exception(exc, "3MF inputs") from exc
     except ModelSurfaceError as exc:
         detail = public_model_surface_error_detail(exc)
         if detail is None:
@@ -3151,8 +3179,8 @@ async def _generate_large_format_svg_native(
             )
         finally:
             _remove_temp_path(native_heightmap_path)
-    except (WipeTowerLayoutError, NativeMaterialSelectionError, ExternalSpoolSelectionError, TemplateSlotCapacityError) as exc:
-        raise to_http_exception(exc, "large-format 3MF layout") from exc
+    except _EXPORT_INPUT_ERRORS as exc:
+        raise to_http_exception(exc, "large-format 3MF inputs") from exc
     except LargeFormatCachedAnalysisError as e:
         _log_large_format_failure(
             session_id=sid,
@@ -3852,9 +3880,9 @@ async def _generate_large_format_raster(
             except (DynamicMaterialCandidateError, DynamicMaterialSolverError) as e:
                 _discard_pending_awaitables(futures, future_index + 1)
                 _handle_core_error(e, "large-format tile generation")
-            except (WipeTowerLayoutError, NativeMaterialSelectionError, ExternalSpoolSelectionError, TemplateSlotCapacityError) as exc:
+            except _EXPORT_INPUT_ERRORS as exc:
                 _discard_pending_awaitables(futures, future_index + 1)
-                raise to_http_exception(exc, "large-format tile layout") from exc
+                raise to_http_exception(exc, "large-format tile inputs") from exc
             except ROUTER_HANDLED_ERRORS as e:
                 failed_tiles.append(tile_ids[future_index])
                 errors.append(f"{label}: {e}")
@@ -4603,13 +4631,13 @@ async def convert_batch(
     db_names: list[str] | str | None = Form(None, description="原生 DB 名称列表"),
     material_source: str = Form("lut", description="颜色来源: lut | material_archive"),
     selected_materials: list[str] | str | None = Form(None, description="已选耗材目录名列表"),
-    material_layer_count: int | None = Form(None, ge=1, le=20, description="耗材模式叠色层数"),
+    material_layer_count: int | None = Form(None, ge=1, le=30, description="耗材模式叠色层数"),
     material_dynamic_layer_count_enabled: bool = Form(
         False,
         description="启用耗材模式动态有效叠层数",
     ),
-    material_min_layer_count: int = Form(5, description="最小有效叠层数 (5-10)"),
-    material_max_layer_count: int = Form(10, description="最大有效叠层数 (5-10)"),
+    material_min_layer_count: int = Form(5, description="最小有效叠层数 (5-30)"),
+    material_max_layer_count: int = Form(10, description="最大有效叠层数 (5-30)"),
     material_delta_e00_tolerance: float = Form(
         0.5,
         description="短配方允许的 CIEDE2000 色差损失 (0-5)",
@@ -4637,7 +4665,7 @@ async def convert_batch(
     structure_mode: str = Form("Double-sided", description="打印结构模式"),
     color_mode: str = Form("4-Color (RYBW)", description="颜色模式"),
     modeling_mode: str = Form("high-fidelity", description="建模模式"),
-    color_layers: int | None = Form(None, ge=1, le=20, description="叠色层数"),
+    color_layers: int | None = Form(None, ge=1, le=30, description="叠色层数"),
     layer_height_mm: float | None = Form(None, gt=0.0, le=1.0, description="叠色层高 (mm)"),
     quantize_colors: int = Form(48, description="K-Means 色彩细节（仅高保真模式生效）"),
     enable_cleanup: bool = Form(True, description="孤立像素清理"),
@@ -5050,8 +5078,7 @@ async def convert_batch(
                         ))
                 except (
                     BrokenProcessPool, DynamicMaterialCandidateError,
-                    DynamicMaterialSolverError, WipeTowerLayoutError, NativeMaterialSelectionError,
-                    ExternalSpoolSelectionError, TemplateSlotCapacityError,
+                    DynamicMaterialSolverError, *_EXPORT_INPUT_ERRORS,
                 ):
                     raise
                 except ROUTER_HANDLED_ERRORS as exc:
@@ -5070,8 +5097,8 @@ async def convert_batch(
         raise HTTPException(status_code=503, detail=BATCH_GENERATION_FAILED_DETAIL) from exc
     except (DynamicMaterialCandidateError, DynamicMaterialSolverError) as exc:
         _handle_core_error(exc, "batch material generation")
-    except (WipeTowerLayoutError, NativeMaterialSelectionError, ExternalSpoolSelectionError, TemplateSlotCapacityError) as exc:
-        raise to_http_exception(exc, "batch 3MF layout") from exc
+    except _EXPORT_INPUT_ERRORS as exc:
+        raise to_http_exception(exc, "batch 3MF inputs") from exc
     finally:
         # Release returned artifacts on cancellation or any fatal failure.
         if not workers_completed:
@@ -5225,7 +5252,7 @@ async def convert_batch(
             error_message=str(exc),
             stage=stage,
         )
-        if isinstance(exc, (WipeTowerLayoutError, NativeMaterialSelectionError, ExternalSpoolSelectionError, TemplateSlotCapacityError)):
+        if isinstance(exc, _EXPORT_INPUT_ERRORS):
             _cleanup_intermediates(intermediates + merged_outputs, batch_run_id)
             _remove_temp_path(temp_native_bundle_path)
             raise to_http_exception(exc, "batch 3MF layout") from exc

@@ -5,6 +5,7 @@ import { useApplicationMenuCommand, useApplicationMenuLanguage } from "./integra
 import type { HealthResponse } from "./api/types";
 import { trackLuminaEvent } from "./analytics/umami";
 import { useAutoPreview } from "./hooks/useAutoPreview";
+import { useDynamicMaterialCatalog } from "./hooks/useDynamicMaterialCatalog";
 import { useVectorPreviewRenderer } from "./hooks/useVectorPreviewRenderer";
 import { useAnnouncement } from "./hooks/useAnnouncement";
 import { usePuzzleLayoutPreview } from "./hooks/usePuzzleLayoutPreview";
@@ -53,10 +54,11 @@ import ExtractorPanel from "./components/ExtractorPanel";
 import ColorcheckerConfirmDialogExtractor from "./components/ColorcheckerConfirmDialog";
 import GradientCardGeneratePanel from "./components/GradientCardGeneratePanel";
 import GradientCardExtractPanel from "./components/GradientCardExtractPanel";
-import MaterialCloudSyncPanel from "./components/MaterialCloudSyncPanel";
+import ResourceCatalogPanel from "./components/ResourceCatalogPanel";
 import MaterialLibraryPanel from "./components/MaterialLibraryPanel";
 import MaterialRecipeQueryPanel from "./components/MaterialRecipeQueryPanel";
-import LutCloudSyncPanel from "./components/LutCloudSyncPanel";
+import MaterialGamutPanel from "./components/materialWorkbench/MaterialGamutPanel";
+import MaterialCachePanel from "./components/materialWorkbench/MaterialCachePanel";
 import LutLibraryPanel from "./components/LutLibraryPanel";
 import LutComparePanel from "./components/LutComparePanel";
 import LutManagerPanel from "./components/LutManagerPanel";
@@ -237,7 +239,8 @@ function AppContent({ connected }: { connected: boolean | null }) {
     useShallow((s) => collectConverterKeepFileIds(s)),
   );
   const singleStageSessionId = useSingleStageStore((s) => s.sessionId);
-  useSessionLease(converterSessionId, "converter", converterKeepFileIds);
+  const expireConverterSession = useConverterStore((s) => s.expireSession);
+  useSessionLease(converterSessionId, "converter", converterKeepFileIds, expireConverterSession);
   useSessionLease(singleStageSessionId, "single_stage");
   useActionHistoryBootstrap();
   useAutoPreview();
@@ -338,6 +341,7 @@ function AppContent({ connected }: { connected: boolean | null }) {
     setBugReportPreset("");
   }, [dismissErrorTicketPrompt]);
   const activeTab = useWidgetStore((s) => s.activeTab);
+  useDynamicMaterialCatalog(connected === true && activeTab === "converter" && !projectOpening);
   useEffect(() => {
     if (activeTab === "workshop") useWorkshopProjectRuntime.setState({ mounted: true });
   }, [activeTab]);
@@ -573,8 +577,10 @@ function AppContent({ connected }: { connected: boolean | null }) {
         {activeTab === 'gradient-card-generate' && <GradientCardGeneratePanel />}
         {activeTab === 'gradient-card-extract' && <GradientCardExtractPanel />}
         {activeTab === 'material-library' && <MaterialLibraryPanel />}
-        {activeTab === 'material-cloud-sync' && <MaterialCloudSyncPanel />}
+        {activeTab === 'material-cloud-sync' && <ResourceCatalogPanel kind="materials" />}
         {activeTab === 'material-recipe' && <MaterialRecipeQueryPanel />}
+        {activeTab === 'material-gamut' && <MaterialGamutPanel />}
+        {activeTab === 'material-cache' && <MaterialCachePanel />}
 
         {activeTab === 'extractor' && (
           <div className="flex h-full min-h-0 flex-col xl:flex-row">
@@ -587,7 +593,7 @@ function AppContent({ connected }: { connected: boolean | null }) {
 
         {activeTab === 'lut-library' && <LutLibraryPanel />}
         {activeTab === 'lut-manager' && <LutManagerPanel />}
-        {activeTab === 'lut-cloud-sync' && <LutCloudSyncPanel />}
+        {activeTab === 'lut-cloud-sync' && <ResourceCatalogPanel kind="luts" />}
         {activeTab === 'lut-details' && <LutDetailsPanel />}
         {activeTab === 'lut-compare' && <LutComparePanel />}
         {activeTab === 'five-color' && (

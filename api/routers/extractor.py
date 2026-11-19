@@ -5,12 +5,14 @@ Extractor 领域 API 路由模块。
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, List, Tuple
 
 import cv2
@@ -72,7 +74,7 @@ from core.extractor import (
 )
 from core.lut_card_layout import (
     LutCardLayout,
-    LutCardPage,
+    cell_for_row_index,
     cell_from_normalized_point,
     localize_page_layout,
     overlay_bbox_for_cell,
@@ -662,23 +664,36 @@ def _resolve_session_lut_layout(
         )
         if total_count <= page_layout.capacity:
             return localize_page_layout(page_layout, item_count=total_count)
+        layout = resolve_lut_layout(color_mode, total_count)
+        page_index = min(max(_parse_page_number(page) - 1, 0), len(layout.pages) - 1)
+        # A merged LUT keeps global row indexes while showing one physical card.
+        return replace(layout, pages=(replace(layout.pages[page_index], card_index=0),))
     return resolve_lut_layout(color_mode, total_count)
 
 
-def _resolve_session_page_layout(session_data: dict | None, rgb_count: int) -> LutCardPage | None:
+def _resolve_session_lut_preview_layout(
+    session_data: dict | None,
+    rgb_count: int,
+    row_index: int | None = None,
+) -> LutCardLayout | None:
     if not session_data:
         return None
     color_mode = str(session_data.get("color_mode") or "")
     if not color_mode:
         return None
-    layout = _resolve_session_lut_layout(
+    page = str(session_data.get("page") or "Page 1")
+    if row_index is not None:
+        layout = resolve_lut_layout(color_mode, rgb_count)
+        if len(layout.pages) > 1:
+            cell = cell_for_row_index(layout, row_index)
+            page = str(cell.page_index + 1)
+    return _resolve_session_lut_layout(
         color_mode=color_mode,
         total_count=rgb_count,
-        page=str(session_data.get("page") or "Page 1"),
+        page=page,
         eight_color_full_export=bool(session_data.get("eight_color_full_export")),
         current_page=True,
     )
-    return layout.pages[0] if layout.pages else None
 
 
 def _parse_page_number(page: str, default: int = 1) -> int:
@@ -1715,10 +1730,13 @@ def extractor_manual_fix(
 
     manual_fix_start = time.perf_counter()
     try:
-        page_layout = None
+        preview_layout = None
         if lut_path:
             rgb_for_layout, _stacks_for_layout, _metadata_for_layout = LUTManager.load_lut_with_metadata(lut_path)
-            page_layout = _resolve_session_page_layout(session_data, len(rgb_for_layout))
+            preview_layout = _resolve_session_lut_preview_layout(
+                session_data, len(rgb_for_layout), row_index=request.row_index,
+            )
+        page_layout = preview_layout.pages[0] if preview_layout is not None else None
         preview_result, status_msg = manual_fix_cell(
             coord=request.cell_coord,
             row_index=request.row_index,
@@ -1746,6 +1764,8 @@ def extractor_manual_fix(
         "lut_preview.png",
         ttl_seconds=None if has_valid_session else EPHEMERAL_PREVIEW_TTL_SECONDS,
     )
+    if has_valid_session and page_layout is not None:
+        store.put(request.session_id, "page", f"Page {page_layout.page_index + 1}")
     cell_coord_row = int(request.cell_coord[0]) if request.cell_coord is not None else None
     cell_coord_col = int(request.cell_coord[1]) if request.cell_coord is not None else None
 
@@ -1767,8 +1787,8 @@ def extractor_manual_fix(
         message=status_msg or "Cell updated",
         lut_preview_url=f"/api/files/{preview_id}",
         lut_layout=(
-            localize_page_layout(page_layout, len(rgb_for_layout)).to_dict()
-            if page_layout is not None
+            preview_layout.to_dict()
+            if preview_layout is not None
             else None
         ),
     )
@@ -1796,7 +1816,7 @@ def extractor_resolve_cell(
         total_count=len(rgb),
         page=str(session_data.get("page") or "Page 1"),
         eight_color_full_export=bool(session_data.get("eight_color_full_export")),
-        current_page=True,
+        current_page=request.card_index == 0,
     )
     try:
         cell = cell_from_normalized_point(
@@ -2100,8 +2120,8 @@ def confirm_palette(
                 existing_metadata.color_mode = session_data["color_mode"]
             if stacks is None:
                 stacks = np.zeros((len(rgb), 0), dtype=np.int32)
-            LUTManager.save_keyed_json(lut_path, rgb, stacks, existing_metadata)
             metadata = existing_metadata
+            LUTManager.save_keyed_json(lut_path, rgb, stacks, existing_metadata)
         except LUT_PERSIST_WARNING_ERRORS as e:
             persist_warning = f"调色板已确认，但持久化到磁盘失败: {e}"
             log.warning(
@@ -2133,3 +2153,55 @@ def confirm_palette(
     if persist_warning:
         return {"status": "warning", "message": persist_warning}
     return {"status": "ok", "message": "调色板已确认"}
+
+
+@router.post("/{session_id}/install-lut")
+async def install_confirmed_lut(
+    session_id: str,
+    store: SessionStore = Depends(get_session_store),
+) -> dict[str, Any]:
+    """Explicitly import the latest confirmed extraction into the local library."""
+    from api.routers.lut import upload_lut, invalidate_lut_details_service_cache
+    from api.services.contribution_queue import capture_calibration
+
+    session_data = store.get(session_id)
+    if session_data is None:
+        raise HTTPException(status_code=404, detail="Extraction session was not found. Extract the card again.")
+    metadata = session_data.get("lut_metadata")
+    source = session_data.get("lut_path")
+    if not isinstance(metadata, LUTMetadata) or not metadata.palette:
+        raise HTTPException(status_code=409, detail="Confirm the LUT palette before adding it to the local library.")
+    if not source or not Path(source).is_file():
+        raise HTTPException(status_code=404, detail="The extracted LUT is no longer available. Extract the card again.")
+    # The original download may predate palette confirmation. Rebuild from the
+    # current session and its confirmed metadata, including a recoverable
+    # confirmation whose disk write failed.
+    try:
+        rgb, stacks, _ = LUTManager.load_lut_with_metadata(source)
+        if stacks is None:
+            stacks = np.zeros((len(rgb), 0), dtype=np.int32)
+        with tempfile.TemporaryDirectory(prefix="confirmed_lut_", dir=TEMP_DIR) as temporary:
+            prepared = Path(temporary) / "confirmed.json"
+            LUTManager.save_keyed_json(str(prepared), rgb, stacks, metadata)
+            payload = prepared.read_bytes()
+            filename = f"Calibration-{hashlib.sha256(payload).hexdigest()[:16]}.json"
+            destination = LUTManager.custom_lut_dir()
+            stem = Path(filename).stem
+            candidates = [destination / filename, *sorted(destination.glob(f"{stem}_*.json"))]
+            for existing in candidates:
+                if existing.is_file() and not existing.is_symlink() and existing.read_bytes() == payload:
+                    invalidate_lut_details_service_cache()
+                    # Re-saving an identical installed LUT is not a new event.
+                    return {"status": "ok", "name": f"Custom - {existing.stem}"}
+            with prepared.open("rb") as handle:
+                result = await upload_lut(UploadFile(file=handle, filename=filename))
+            result["contribution"] = capture_calibration("luts", result["name"])
+            return result
+    except HTTPException:
+        raise
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log.warning("Confirmed LUT could not be added to the library", extra={
+            "event": "extractor_lut_install_failed", "session_id": session_id,
+            "error_type": type(exc).__name__, "error_message": str(exc),
+        })
+        raise HTTPException(status_code=422, detail="The confirmed LUT could not be saved. Check the extraction and try again.") from exc
